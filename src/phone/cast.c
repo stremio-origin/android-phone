@@ -91,8 +91,8 @@ static void parse_desc(Tv *t) {
 }
 /* ---- Android TV and Google TV, our app open or not: Google's TV remote service announces itself over mDNS
    (_androidtvremote2._tcp, the older one _androidtvremote._tcp); the box's name is its service's name ---- */
-static int mdns_query(unsigned char *q) { static const char *svc[2] = { "_androidtvremote2", "_androidtvremote" }; int n = 12; memset(q, 0, 12); q[5] = 2; /* (id 0, a standard query, two questions) */
-  for (int i = 0; i < 2; i++) { const char *lab[3] = { svc[i], "_tcp", "local" }; for (int k = 0; k < 3; k++) { int l = (int)strlen(lab[k]); q[n++] = (unsigned char)l; memcpy(q + n, lab[k], l); n += l; } q[n++] = 0; q[n++] = 0; q[n++] = 12; q[n++] = 0x80; q[n++] = 1; } /* PTR, IN, answered to this socket (unicast) */
+static int mdns_query(unsigned char *q, int qu) { static const char *svc[2] = { "_androidtvremote2", "_androidtvremote" }; int n = 12; memset(q, 0, 12); q[5] = 2; /* (id 0, a standard query, two questions) */
+  for (int i = 0; i < 2; i++) { const char *lab[3] = { svc[i], "_tcp", "local" }; for (int k = 0; k < 3; k++) { int l = (int)strlen(lab[k]); q[n++] = (unsigned char)l; memcpy(q + n, lab[k], l); n += l; } q[n++] = 0; q[n++] = 0; q[n++] = 12; q[n++] = qu ? 0x80 : 0; q[n++] = 1; } /* PTR, IN, answered to this socket (unicast) or, asked from 5353, to the group (multicast) */
   return n; }
 static int dns_name(const unsigned char *m, int len, int at, char *out, int cap, int firstOnly) { int o = 0, jumped = 0, end = -1, hops = 0; if (cap) out[0] = 0;
   while (at < len && hops < 32) { int l = m[at]; if (!l) { if (end < 0) end = at + 1; break; }
@@ -101,7 +101,7 @@ static int dns_name(const unsigned char *m, int len, int at, char *out, int cap,
   (void)jumped; return end; }
 /* an answer naming an Android TV remote service: 1 and its name (the PTR's instance, its first label) */
 static int mdns_atv(const unsigned char *m, int len, char *name, int cap) {
-  if (len < 12) return 0; int qd = m[4] << 8 | m[5], an = (m[6] << 8 | m[7]) + (m[8] << 8 | m[9]) + (m[10] << 8 | m[11]), at = 12; char nm[256];
+  if (len < 12 || !(m[2] & 0x80)) return 0; /* (answers only: on 5353 another phone's question comes in too, its known answers naming a TV that is not it) */ int qd = m[4] << 8 | m[5], an = (m[6] << 8 | m[7]) + (m[8] << 8 | m[9]) + (m[10] << 8 | m[11]), at = 12; char nm[256];
   for (int i = 0; i < qd && at > 0; i++) { at = dns_name(m, len, at, nm, sizeof nm, 0); if (at < 0) return 0; at += 4; }
   for (int i = 0; i < an && at > 0 && at + 10 <= len; i++) { at = dns_name(m, len, at, nm, sizeof nm, 0); if (at < 0 || at + 10 > len) return 0;
     int ty = m[at] << 8 | m[at + 1], rl = m[at + 8] << 8 | m[at + 9], rd = at + 10; if (rd + rl > len) return 0;
@@ -110,9 +110,16 @@ static int mdns_atv(const unsigned char *m, int len, char *name, int cap) {
   return 0; }
 static void *scan_thread(void *a) { (void)a;
   pplat_multicast(1);
-  int fd = socket(AF_INET, SOCK_DGRAM, 0), rf = socket(AF_INET, SOCK_DGRAM, 0), md = socket(AF_INET, SOCK_DGRAM, 0); unsigned char mq[128]; int mql = mdns_query(mq), ttl0 = 255;
+  int fd = socket(AF_INET, SOCK_DGRAM, 0), rf = socket(AF_INET, SOCK_DGRAM, 0), md = socket(AF_INET, SOCK_DGRAM, 0); unsigned char mq[128]; int mql = mdns_query(mq, 1), ttl0 = 255;
   struct sockaddr_in mto; memset(&mto, 0, sizeof mto); mto.sin_family = AF_INET; mto.sin_port = htons(5353); inet_pton(AF_INET, "224.0.0.251", &mto.sin_addr); if (md >= 0) setsockopt(md, IPPROTO_IP, IP_MULTICAST_TTL, &ttl0, sizeof ttl0); if (fd < 0 || rf < 0) { if (fd >= 0) close(fd); if (rf >= 0) close(rf); pthread_mutex_lock(&mu); scanning = 0; pthread_mutex_unlock(&mu); pplat_multicast(0); return NULL; }
   int ttl = 2, on = 1; setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof ttl); setsockopt(rf, SOL_SOCKET, SO_BROADCAST, &on, sizeof on);
+  /* the same question asked from mDNS's own port too (5353, shared with the phone's own responder), its answer to the group: Android 14's
+     responder (a Google TV) answers no question from another port (RFC 6762's "legacy unicast", md's), older boxes answer both */
+  int m5 = socket(AF_INET, SOCK_DGRAM, 0); unsigned char mq5[128]; int mq5l = mdns_query(mq5, 0); if (m5 >= 0) { struct sockaddr_in b5; memset(&b5, 0, sizeof b5); b5.sin_family = AF_INET; b5.sin_port = htons(5353); setsockopt(m5, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+#ifdef SO_REUSEPORT
+    setsockopt(m5, SOL_SOCKET, SO_REUSEPORT, &on, sizeof on);
+#endif
+    if (bind(m5, (struct sockaddr *)&b5, sizeof b5) < 0) { fprintf(stderr, "[cast] mDNS: port 5353 not shared (%d): the other port's question only\n", errno); close(m5); m5 = -1; } else setsockopt(m5, IPPROTO_IP, IP_MULTICAST_TTL, &ttl0, sizeof ttl0); }
   struct sockaddr_in to; memset(&to, 0, sizeof to); to.sin_family = AF_INET; to.sin_port = htons(1900); inet_pton(AF_INET, "239.255.255.250", &to.sin_addr);
   struct sockaddr_in bc; memset(&bc, 0, sizeof bc); bc.sin_family = AF_INET; bc.sin_port = htons(RX_PORT); inet_pton(AF_INET, "255.255.255.255", &bc.sin_addr);
   static const char *ST[3] = { "urn:lge-com:service:webos-second-screen:1", "urn:samsung.com:device:RemoteControlReceiver:1", "urn:dial-multiscreen-org:service:dial:1" };
@@ -123,24 +130,27 @@ static void *scan_thread(void *a) { (void)a;
   { struct ifaddrs *ifs = NULL; if (!getifaddrs(&ifs)) { for (struct ifaddrs *f = ifs; f; f = f->ifa_next) { if (!f->ifa_addr || f->ifa_addr->sa_family != AF_INET || !f->ifa_netmask || (f->ifa_flags & IFF_LOOPBACK)) continue;
       unsigned ip = ntohl(((struct sockaddr_in *)f->ifa_addr)->sin_addr.s_addr), mask = ntohl(((struct sockaddr_in *)f->ifa_netmask)->sin_addr.s_addr); if (!mask || ~mask > 1022 || ~mask < 3) continue; /* (a /22 at most; never a one-address tunnel: a VPN's) */
       if (!((ip >> 24) == 10 || (ip >> 20) == (172u << 4 | 1) || (ip >> 16) == (192u << 8 | 168))) continue; /* (a home network only) */
+      if (m5 >= 0) { struct ip_mreq mr; memset(&mr, 0, sizeof mr); mr.imr_multiaddr = mto.sin_addr; mr.imr_interface.s_addr = htonl(ip); setsockopt(m5, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mr, sizeof mr); setsockopt(m5, IPPROTO_IP, IP_MULTICAST_IF, &mr.imr_interface, sizeof mr.imr_interface); sendto(m5, mq5, mq5l, 0, (struct sockaddr *)&mto, sizeof mto); } /* (the group on this network's interface: never the mobile one's) */
       unsigned net = ip & mask, last = net | ~mask; int blocked = 0; static const char SSDP_LG[] = "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: urn:lge-com:service:webos-second-screen:1\r\n\r\n";
       for (unsigned h = net + 1; h < last; h++) { if (h == ip) continue; struct sockaddr_in d; memset(&d, 0, sizeof d); d.sin_family = AF_INET; d.sin_addr.s_addr = htonl(h);
         d.sin_port = htons(RX_PORT); if (sendto(rf, "SBORIGIN?", 9, 0, (struct sockaddr *)&d, sizeof d) < 0 && errno == EPERM) blocked = 1; d.sin_port = htons(1900); sendto(fd, SSDP_LG, sizeof SSDP_LG - 1, 0, (struct sockaddr *)&d, sizeof d); if (md >= 0) { d.sin_port = htons(5353); sendto(md, mq, mql, 0, (struct sockaddr *)&d, sizeof d); } } /* (an mDNS question to each too: a responder answers one sent to it) */
+      if (m5 >= 0) sendto(m5, mq5, mq5l, 0, (struct sockaddr *)&mto, sizeof mto); /* (once more: a lost packet) */
       lanBlocked = blocked; if (blocked) fprintf(stderr, "[cast] this phone may not talk to its own network (a VPN app blocks it)\n"); break; } freeifaddrs(ifs); } }
   /* the remembered TVs, asked directly too (a broadcast may not cross every router) */
   { const cJSON *kn = store_node("castTvs"), *e; if (cJSON_IsArray(kn)) cJSON_ArrayForEach(e, kn) { struct sockaddr_in d; memset(&d, 0, sizeof d); d.sin_family = AF_INET; d.sin_port = htons(RX_PORT); if (inet_pton(AF_INET, js_str(e, "ip", ""), &d.sin_addr) == 1) sendto(rf, "SBORIGIN?", 9, 0, (struct sockaddr *)&d, sizeof d); } }
   double end = now_s() + 3.5, again = now_s() + 1.2; Tv found[16]; int nf = 0;
-  while (now_s() < end) { struct pollfd p[3] = { { fd, POLLIN, 0 }, { rf, POLLIN, 0 }, { md, md >= 0 ? POLLIN : 0, 0 } }; if (now_s() > again) { again = end + 1; sendto(rf, "SBORIGIN?", 9, 0, (struct sockaddr *)&bc, sizeof bc); } if (poll(p, md >= 0 ? 3 : 2, 200) <= 0) continue;
-    for (int s = 0; s < 3; s++) { if (!(p[s].revents & POLLIN)) continue; char buf[2048]; struct sockaddr_in from; socklen_t fl = sizeof from; int n = recvfrom(p[s].fd, buf, sizeof buf - 1, 0, (struct sockaddr *)&from, &fl); if (n <= 0) continue; buf[n] = 0;
-      char atvName[96] = ""; if (s == 2 && !mdns_atv((const unsigned char *)buf, n, atvName, sizeof atvName)) continue; /* (mDNS: only an Android TV's remote service) */
+  while (now_s() < end) { struct pollfd p[4] = { { fd, POLLIN, 0 }, { rf, POLLIN, 0 }, { md, md >= 0 ? POLLIN : 0, 0 }, { m5, m5 >= 0 ? POLLIN : 0, 0 } }; if (now_s() > again) { again = end + 1; sendto(rf, "SBORIGIN?", 9, 0, (struct sockaddr *)&bc, sizeof bc); } if (poll(p, 4, 200) <= 0) continue; /* (a closed one, -1: skipped) */
+    for (int s = 0; s < 4; s++) { if (!(p[s].revents & POLLIN)) continue; char buf[2048]; struct sockaddr_in from; socklen_t fl = sizeof from; int n = recvfrom(p[s].fd, buf, sizeof buf - 1, 0, (struct sockaddr *)&from, &fl); if (n <= 0) continue; buf[n] = 0;
+      char atvName[96] = ""; if (s >= 2 && !mdns_atv((const unsigned char *)buf, n, atvName, sizeof atvName)) continue; /* (mDNS: only an Android TV's remote service) */
       char ip[48]; inet_ntop(AF_INET, &from.sin_addr, ip, sizeof ip); int k; for (k = 0; k < nf; k++) if (!strcmp(found[k].ip, ip)) break;
       if (k == nf && nf < 16) { memset(&found[nf], 0, sizeof found[nf]); snprintf(found[nf].ip, sizeof found[nf].ip, "%s", ip); nf++; } if (k >= nf) continue; Tv *t = &found[k];
-      if (s == 2) { t->kind = K_ANDROID; if (!t->name[0] && atvName[0]) snprintf(t->name, sizeof t->name, "%s", atvName); continue; } /* an Android TV or Google TV, our app open on it or not */
+      if (s >= 2) { t->kind = K_ANDROID; if (!t->name[0] && atvName[0]) snprintf(t->name, sizeof t->name, "%s", atvName); continue; } /* an Android TV or Google TV, our app open on it or not */
       if (s == 1) { Rx r; rx_parse(buf, ip, &r); if (!r.ok) continue; t->origin = 1; t->port = r.port; snprintf(t->id, sizeof t->id, "%s", r.id); if (r.name[0]) snprintf(t->name, sizeof t->name, "%s", r.name); if (r.mac[0]) snprintf(t->mac, sizeof t->mac, "%s", r.mac); if (!t->kind || t->kind == K_OTHER) t->kind = strstr(buf, "\"plat\":\"tizen\"") ? K_SAMSUNG : strstr(buf, "\"plat\":\"webos\"") ? K_LG : strstr(buf, "androidtv") ? K_ANDROID : K_OTHER; /* (what our app says it runs on: webOS, Tizen, Android TV; a computer's preview: none of them) */ continue; }
       char *loc = strcasestr(buf, "\nLOCATION:"); char *st = strcasestr(buf, "\nST:");
       if (st && strstr(st, "lge-com")) t->kind = K_LG; else if (st && strstr(st, "samsung.com") && (!t->kind || t->kind == K_OTHER)) t->kind = K_SAMSUNG;
+      char *sv = strcasestr(buf, "\nSERVER:"); if (sv && (!t->kind || t->kind == K_OTHER)) { char ln[160]; snprintf(ln, sizeof ln, "%.*s", (int)strcspn(sv + 1, "\r\n"), sv + 1); if (strcasestr(ln, "android")) t->kind = K_ANDROID; } /* (DIAL from an Android kernel, "Linux/5.15-android14": a Google TV whose description names only its maker; never "Chromecast" alone, a dongle with no remote service) */
       if (loc && (!t->loc[0] || (st && strstr(st, "lge-com")))) { loc += 10; while (*loc == ' ') loc++; size_t l = strcspn(loc, "\r\n"); if (l > 255) l = 255; memcpy(t->loc, loc, l); t->loc[l] = 0; } } }
-  close(fd); close(rf); if (md >= 0) close(md); pplat_multicast(0);
+  close(fd); close(rf); if (md >= 0) close(md); if (m5 >= 0) close(m5); pplat_multicast(0);
   for (int k = 0; k < nf; k++) { char nm[96]; snprintf(nm, sizeof nm, "%s", found[k].name); found[k].name[0] = 0; if (found[k].loc[0]) parse_desc(&found[k]); /* the TV's own name first (what its owner sees), our app's next */
     if (!found[k].name[0]) snprintf(found[k].name, sizeof found[k].name, "%s", nm[0] ? nm : found[k].ip);
     if (!strncmp(found[k].name, "[LG] ", 5) || !strncmp(found[k].name, "[TV] ", 5)) memmove(found[k].name, found[k].name + 5, strlen(found[k].name + 5) + 1); }
